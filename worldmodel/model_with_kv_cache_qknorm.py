@@ -39,6 +39,20 @@ class RotaryType(StrEnum):
     PIXEL = "pixel"
 
 
+class WanRMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return self._norm(x.float()).type_as(x) * self.weight
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
 @functools.lru_cache
 def rope_nd(
     shape: Sequence[int],
@@ -148,6 +162,8 @@ class SelfAttention(nn.Module):
         is_causal: bool,
         attention_type: AttentionType,
         rotary_type: RotaryType = RotaryType.STANDARD,
+        qk_norm: bool = True,
+        eps: float = 1e-6,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -157,8 +173,11 @@ class SelfAttention(nn.Module):
         self.is_causal = is_causal
         self.attention_type = attention_type
         self.rotary_type = rotary_type
+        self.qk_norm = qk_norm
 
         self.qkv_proj = nn.Linear(dim, dim * 3, bias=False)
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.out_proj = nn.Linear(dim, dim)
 
         # Internal cache (preserved for original inference path)
@@ -205,7 +224,10 @@ class SelfAttention(nn.Module):
         x_flat = einops.rearrange(x, "b t h w d -> (b h w) t d")
 
         # Compute Q, K, V for new frames
-        q_new, k_new, v_new = self.qkv_proj(x_flat).chunk(3, dim=-1)
+        qkv = self.qkv_proj(x_flat)
+        q_new, k_new, v_new = qkv.chunk(3, dim=-1)
+        q_new = self.norm_q(q_new)
+        k_new = self.norm_k(k_new)
 
         q_new = einops.rearrange(q_new, "B T (head d) -> B head T d", head=self.num_heads)
         k_new = einops.rearrange(k_new, "B T (head d) -> B head T d", head=self.num_heads)
@@ -255,7 +277,9 @@ class SelfAttention(nn.Module):
         B, T, H, W, D = x.shape
         x_flat = einops.rearrange(x, "b t h w d -> (b h w) t d")
 
-        _, k_new, v_new = self.qkv_proj(x_flat).chunk(3, dim=-1)
+        qkv = self.qkv_proj(x_flat)
+        _, k_new, v_new = qkv.chunk(3, dim=-1)
+        k_new = self.norm_k(k_new)
 
         k_new = einops.rearrange(k_new, "B T (head d) -> B head T d", head=self.num_heads)
         v_new = einops.rearrange(v_new, "B T (head d) -> B head T d", head=self.num_heads)
@@ -268,6 +292,7 @@ class SelfAttention(nn.Module):
         ext_cache["end_idx"] = new_end
 
     # Original internal cache path
+
     def _forward_with_cache(
         self, x: torch.Tensor, start_frame: int, cache_idx: int, cache_type: str = "cond"
     ) -> torch.Tensor:
@@ -277,7 +302,10 @@ class SelfAttention(nn.Module):
         k_cache = self.k_cache_cond if cache_type == "cond" else self.k_cache_null
         v_cache = self.v_cache_cond if cache_type == "cond" else self.v_cache_null
 
-        q, k_new, v_new = self.qkv_proj(x).chunk(3, dim=-1)
+        qkv_new = self.qkv_proj(x)
+        q_new, k_new, v_new = qkv_new.chunk(3, dim=-1)
+        q = self.norm_q(q_new)
+        k_new = self.norm_k(k_new)
         q = einops.rearrange(q, "B T (head d) -> B head T d", head=self.num_heads)
         k_new = einops.rearrange(k_new, "B T (head d) -> B head T d", head=self.num_heads)
         v_new = einops.rearrange(v_new, "B T (head d) -> B head T d", head=self.num_heads)
@@ -357,6 +385,8 @@ class SelfAttention(nn.Module):
         sequence_shape = x.shape[1:-1]
 
         q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
         q = einops.rearrange(q, "B ... (head d) -> B head ... d", head=self.num_heads)
         k = einops.rearrange(k, "B ... (head d) -> B head ... d", head=self.num_heads)
         v = einops.rearrange(v, "B ... (head d) -> B head ... d", head=self.num_heads)
@@ -427,15 +457,18 @@ class SelfAttentionBlock(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, qk_norm: bool = True, eps: float = 1e-6):
         super().__init__()
         assert dim % num_heads == 0
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.qk_norm = qk_norm
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.kv_proj = nn.Linear(dim, dim * 2, bias=False)
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.out_proj = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor, mask: torch.Tensor | None = None):
@@ -446,6 +479,8 @@ class CrossAttention(nn.Module):
 
         q = self.q_proj(q_in)
         k, v = self.kv_proj(kv_in).chunk(2, dim=-1)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
 
         q = q.view(B * T, H * W, h, self.head_dim).transpose(1, 2).contiguous()
         k = k.view(B * T, kv_in.size(1), h, self.head_dim).transpose(1, 2).contiguous()
@@ -671,10 +706,7 @@ class DiT(nn.Module):
         if external_kv_cache is not None:
             # External cache path: x already contains only new frames
             for layer_idx, block in enumerate(self.blocks):
-                x_in_req_grad = x.requires_grad
                 x = block(x, c, ext_cache=external_kv_cache[layer_idx])
-                if x_in_req_grad and not x.requires_grad:
-                     print(f"[DEBUG model] Gradient lost in block {layer_idx} (external cache)!", flush=True)
         else:
             # Original path: handle internal cache slicing
             has_cache = any(
@@ -696,7 +728,6 @@ class DiT(nn.Module):
         x = self.unpatchify(x)
         x = einops.rearrange(x, "(b t) h w c -> b t h w c", t=T)
         return x
-
 
     def forward_and_cache(
         self,
@@ -739,7 +770,7 @@ class DiT(nn.Module):
 
             attn_input = block.t_block.norm1(x_hidden) * (1 + m[1]) + m[0]
 
-            # Run attention with external cache 
+            # Run attention with external cache (reads + attends)
             attn_out = block.t_block.attn._forward_with_external_cache(
                 attn_input, external_kv_cache[layer_idx]
             )

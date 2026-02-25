@@ -1,1 +1,1 @@
-Few-step distillation pipeline for action conditioned world model
+Few-step distillation pipeline for action conditioned world model.

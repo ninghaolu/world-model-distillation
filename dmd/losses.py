@@ -121,6 +121,14 @@ def compute_kl_grad(
 
     return grad, {
         "dmd_gradient_norm": torch.mean(torch.abs(grad)).detach(),
+        "real_score_x0_mean": x0_real.mean().detach(),
+        "real_score_x0_std": x0_real.std().detach(),
+        "real_score_x0_absmax": x0_real.abs().max().detach(),
+        "fake_score_x0_mean": x0_fake.mean().detach(),
+        "fake_score_x0_std": x0_fake.std().detach(),
+        "fake_score_x0_absmax": x0_fake.abs().max().detach(),
+        "score_diff_l2": (x0_fake - x0_real).pow(2).mean().sqrt().detach(),
+        "score_diff_mean": (x0_fake - x0_real).mean().detach(),
     }
 
 
@@ -162,10 +170,12 @@ def compute_generator_loss(
     """
     B, T = generated_video.shape[:2]
 
+    # Detach generated_video for all no-grad operations (score model calls, noising).
+    # The original generated_video (with grad_fn) is only used in the final MSE loss.
+    generated_video_detached = generated_video.detach()
+
     with torch.no_grad():
         # Sample ONE random timestep per sample (NOT per frame)
-        # The score models process the full video — all frames get the same noise level
-        # This matches CausalForcing's _get_timestep which samples (B,) timesteps
         timestep_per_sample = torch.randint(
             min_timestep, max_timestep, (B,),
             device=generated_video.device, dtype=torch.long,
@@ -173,14 +183,14 @@ def compute_generator_loss(
         # Broadcast to (B, T) for q_sample
         timestep = timestep_per_sample.unsqueeze(1).expand(B, T)
 
-        # Add noise to generated video
-        noise = torch.randn_like(generated_video)
-        noisy = q_sample(generated_video, noise, alphas_cumprod, timestep)
+        # Add noise to DETACHED generated video
+        noise = torch.randn_like(generated_video_detached)
+        noisy = q_sample(generated_video_detached, noise, alphas_cumprod, timestep)
 
-        # Compute KL gradient
+        # Compute KL gradient using detached tensors
         grad, log_dict = compute_kl_grad(
             noisy_latent=noisy,
-            estimated_clean=generated_video,
+            estimated_clean=generated_video_detached,
             timestep=timestep,
             action=actions,
             real_score=real_score,
@@ -190,10 +200,18 @@ def compute_generator_loss(
             fake_guidance_scale=fake_guidance_scale,
         )
 
-    # Pseudo-MSE loss
-    # generated_video has grad, target is detached → gradients only flow through generator
-    target = (generated_video - grad).detach()
-    loss = 0.5 * F.mse_loss(generated_video.float(), target.float())
+    # Pseudo-MSE loss.
+    # generated_video (with grad_fn) vs detached target — gradients only flow through generator.
+    target = (generated_video_detached - grad).detach()
+    loss = 0.5 * F.mse_loss(generated_video, target.to(generated_video.dtype))
+
+    log_dict["gen_video_mean"] = generated_video.mean().detach()
+    log_dict["gen_video_std"] = generated_video.std().detach()
+    log_dict["gen_video_absmax"] = generated_video.abs().max().detach()
+    log_dict["gen_target_mean"] = target.mean().detach()
+    log_dict["gen_target_std"] = target.std().detach()
+    log_dict["gen_target_diff_l2"] = (generated_video.detach() - target).pow(2).mean().sqrt().detach()
+    log_dict["sampled_timestep"] = timestep_per_sample.float().mean().detach()
 
     return loss, log_dict
 

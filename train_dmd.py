@@ -41,6 +41,7 @@ from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
 
+import worldmodel.model_with_kv_cache
 from worldmodel.model_with_kv_cache import DiT
 from worldmodel.vae import VAE
 from dmd.diffusion_utils import get_alphas_cumprod, get_denoising_step_list
@@ -62,7 +63,7 @@ def main(
     input_w: int = 256,
     n_frames: int = 20,  # kept for dataloader compat; overridden by n_total_frames for generation
     frame_skip: int = 1,
-    action_dim: int = 10,
+    action_dim: int = 21,
     num_workers: int = 16,
     dataset_fps: int = 10,
     # Training
@@ -74,7 +75,7 @@ def main(
     ema_decay: float = 0.99,
     max_train_steps: int = 100_000,
     weight_decay: float = 0.02,
-    grad_clip_norm: float = 10.0,
+    grad_clip_norm: float = 5.0,
     beta1: float = 0.0,
     beta2: float = 0.999,
     beta1_critic: float = 0.0,
@@ -88,6 +89,7 @@ def main(
     min_timestep_pct: float = 0.02,         # for sampling t
     max_timestep_pct: float = 0.98,
     n_grad_frames: int = 1,
+    num_frame_per_block: int = 1,
     # Rolling KV cache training (Section 3.4):
     # Generate n_total_frames but only score the last n_output_frames.
     # The early "warmup" frames build KV cache context and get evicted,
@@ -103,7 +105,7 @@ def main(
     heads: int = 16,
     # Logging
     validate_every: int = 2000,
-    log_every: int = 100,
+    log_every: int = 50,
     # Sampling / eval
     cfg: float = 3.0,
     # WandB
@@ -383,7 +385,8 @@ def main(
                     n_output_frames=n_output_frames,
                     max_cache_frames=max_cache_frames,
                     grad_frames_from=grad_frames_from,
-                )
+                    num_frame_per_block=num_frame_per_block,
+                )       # [B, n_output_frames, H, W, C]
 
                 # DMD loss on the output window
                 # Actions for the output window: last n_output_frames of the full sequence
@@ -402,7 +405,16 @@ def main(
                     fake_guidance_scale=fake_guidance_scale,
                 )
 
-            gen_loss.backward()
+            if not gen_loss.requires_grad:
+                # print generator parameters state
+                for name, param in generator.named_parameters():
+                    if param.requires_grad and param.grad is None:
+                         pass # Expected before backward
+                    if not param.requires_grad:
+                        print(f"[DEBUG] Parameter {name} does not require grad!", flush=True)
+            else:
+                gen_loss.backward()
+
             if grad_clip_norm:
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), grad_clip_norm)
             gen_opt.step()
@@ -412,6 +424,21 @@ def main(
 
             running_gen_loss += gen_loss.detach().item()
             num_gen_batches += 1
+
+            # Print score diagnostics (first step only, then every log_every)
+            if rank == 0 and (train_steps == 0 or train_steps % log_every == 0):
+                def _v(key):
+                    v = gen_log.get(key, 0)
+                    return v.item() if hasattr(v, 'item') else v
+                print(
+                    f"[step {train_steps}] gen_loss={gen_loss.item():.6f}  "
+                    f"real_x0: mean={_v('real_score_x0_mean'):.4f} std={_v('real_score_x0_std'):.4f}  "
+                    f"fake_x0: mean={_v('fake_score_x0_mean'):.4f} std={_v('fake_score_x0_std'):.4f}  "
+                    f"score_diff_l2={_v('score_diff_l2'):.4f}  "
+                    f"kl_grad_norm={_v('dmd_gradient_norm'):.4f}  "
+                    f"gen_video: mean={_v('gen_video_mean'):.4f} std={_v('gen_video_std'):.4f}",
+                    flush=True,
+                )
 
         # Critic update (every step)
         fake_score.train()
@@ -431,6 +458,7 @@ def main(
                     n_output_frames=n_output_frames,
                     max_cache_frames=max_cache_frames,
                     grad_frames_from=None,  # no grad
+                    num_frame_per_block=num_frame_per_block, 
                 )
 
             # Actions for the output window
@@ -461,8 +489,9 @@ def main(
                 log_dict["critic_loss"] = running_critic_loss / num_critic_batches
             if num_gen_batches > 0:
                 log_dict["generator_loss"] = running_gen_loss / num_gen_batches
-            if train_gen and "dmd_gradient_norm" in gen_log:
-                log_dict["dmd_gradient_norm"] = gen_log["dmd_gradient_norm"].item()
+            if train_gen and gen_log:
+                for k, v in gen_log.items():
+                    log_dict[k] = v.item() if hasattr(v, 'item') else v
 
             log_dict["lr_generator"] = gen_opt.param_groups[0]["lr"]
             log_dict["lr_critic"] = critic_opt.param_groups[0]["lr"]

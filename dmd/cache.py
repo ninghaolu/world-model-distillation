@@ -82,27 +82,26 @@ def clear_kv_cache(cache: list[dict]) -> None:
         layer_cache["end_idx"] = 0
 
 
-def evict_oldest_frame(cache: list[dict]) -> None:
+def evict_oldest_block(cache: list[dict], num_frame_per_block: int) -> None:
     """
-    Rolling KV cache eviction (Algorithm 2, Line 10-11).
-
-    Removes the oldest frame's KV entries by shifting everything left by 1.
-    Used for long video generation beyond max_frames.
+    Evict the oldest block (num_frame_per_block frames) from the cache.
+    For chunk-wise generation, always evict a whole block to keep cache
+    semantically consistent (no partial blocks).
     """
     for layer_cache in cache:
         end_idx = layer_cache["end_idx"]
-        if end_idx <= 0:
+        n = num_frame_per_block
+        if end_idx < n:
             return
-
-        # Shift frames left by 1
-        layer_cache["k"][:, :, :end_idx - 1, :] = layer_cache["k"][:, :, 1:end_idx, :].clone()
-        layer_cache["v"][:, :, :end_idx - 1, :] = layer_cache["v"][:, :, 1:end_idx, :].clone()
-
-        # Zero out the now-free slot
-        layer_cache["k"][:, :, end_idx - 1, :] = 0
-        layer_cache["v"][:, :, end_idx - 1, :] = 0
-
-        layer_cache["end_idx"] = end_idx - 1
+        remaining = end_idx - n
+        # Shift everything left by n slots
+        if remaining > 0:
+            layer_cache["k"][:, :, :remaining, :] = layer_cache["k"][:, :, n:end_idx, :].clone()
+            layer_cache["v"][:, :, :remaining, :] = layer_cache["v"][:, :, n:end_idx, :].clone()
+        # Zero freed slots
+        layer_cache["k"][:, :, remaining:end_idx, :] = 0
+        layer_cache["v"][:, :, remaining:end_idx, :] = 0
+        layer_cache["end_idx"] = remaining
 
 
 def get_cache_info(cache: list[dict]) -> dict:

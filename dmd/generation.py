@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
-from dmd.cache import create_kv_cache, clear_kv_cache, evict_oldest_frame
+from dmd.cache import create_kv_cache, clear_kv_cache, evict_oldest_block
 from dmd.diffusion_utils import v_pred_to_x0, q_sample
 
 
@@ -52,6 +52,7 @@ def self_forcing_rollout(
     n_output_frames: int,
     max_cache_frames: int,
     grad_frames_from: Optional[int] = None,
+    num_frame_per_block: int = 1,
 ) -> torch.Tensor:
     """
     Self-Forcing autoregressive rollout (Algorithm 1) with rolling KV cache.
@@ -90,11 +91,13 @@ def self_forcing_rollout(
         output: [B, n_output_frames, H, W, C] the last n_output_frames of the
             generated video, for use with DMD loss.
     """
-    assert n_output_frames <= n_total_frames, (
-        f"n_output_frames ({n_output_frames}) must be <= n_total_frames ({n_total_frames})"
-    )
-    assert actions.shape[1] >= n_total_frames, (
-        f"actions sequence length ({actions.shape[1]}) must be >= n_total_frames ({n_total_frames})"
+    assert n_output_frames <= n_total_frames
+    assert actions.shape[1] >= n_total_frames
+
+    # n_total_frames - 1 generated frames must be divisible by num_frame_per_block
+    n_gen_frames = n_total_frames - 1  # excluding the initial real frame
+    assert n_gen_frames % num_frame_per_block == 0, (
+        f"n_total_frames-1 ({n_gen_frames}) must be divisible by num_frame_per_block ({num_frame_per_block})"
     )
 
     B, _, H, W, C = initial_latent.shape
@@ -102,22 +105,21 @@ def self_forcing_rollout(
     dtype = initial_latent.dtype
 
     num_denoising_steps = len(denoising_step_list)
+    num_blocks = n_gen_frames // num_frame_per_block
+    output_start_frame = n_total_frames - n_output_frames  # in full-sequence indexing
 
-    # The output window starts at this frame index (in the full generation)
-    output_start_frame = n_total_frames - n_output_frames
-
-    # Sample exit step s (same across all frames, synced across ranks) 
+    # Sample ONE exit step, shared across all blocks (broadcast for DDP consistency)
     exit_step_idx = torch.randint(0, num_denoising_steps, (1,), device=device)
     if dist.is_initialized():
         dist.broadcast(exit_step_idx, src=0)
     exit_step_idx = exit_step_idx.item()
 
-    # Compute patch dimensions for cache 
+    # Patch dimensions for cache allocation
     patch_size = generator.patch_size
     h_patch = H // patch_size
     w_patch = W // patch_size
 
-    # Create external KV cache 
+    # Create external KV cache
     kv_cache = create_kv_cache(
         num_layers=generator.num_layers,
         batch_size=B,
@@ -130,7 +132,7 @@ def self_forcing_rollout(
         dtype=dtype,
     )
 
-    # Step 1: write the initial frame to the cache 
+    # Write initial (real) frame into the cache at t=0
     t_zero = torch.zeros([B, 1], device=device, dtype=torch.long)
     with torch.no_grad():
         generator.forward_and_cache(
@@ -140,93 +142,96 @@ def self_forcing_rollout(
             external_kv_cache=kv_cache,
         )
 
-    # Initialize full generation buffer 
-    # We store all frames but only return the last n_output_frames
-    all_frames = torch.zeros([B, n_total_frames, H, W, C], device=device, dtype=dtype)
-    all_frames[:, 0] = initial_latent[:, 0]
+    output_frames = []  # list of [B, H, W, C] tensors for the output window
 
-    # Step 2: Generate frames 1..n_total_frames-1 
-    for frame_idx in range(1, n_total_frames):
-        # Determine if this frame is in the output window AND should have grad
-        in_output_window = (frame_idx >= output_start_frame)
-        output_idx = frame_idx - output_start_frame  # index within output tensor
+    # Iterate over blocks
+    for block_idx in range(num_blocks):
+        # Frame indices (in the full sequence) for this block: 1-indexed since frame 0 is real
+        block_start = 1 + block_idx * num_frame_per_block          # e.g., 1, 4, 7, ...
+        block_end   = block_start + num_frame_per_block            # exclusive
+        block_frame_indices = list(range(block_start, block_end))  # [block_start, ..., block_end-1]
 
-        enable_grad = (
-            grad_frames_from is not None
-            and in_output_window
-            and output_idx >= grad_frames_from
-        )
+        # Actions for this block: [B, num_frame_per_block, D]
+        frame_actions = actions[:, block_start:block_end]
 
-        # Start from pure noise
-        noisy_input = torch.randn([B, 1, H, W, C], device=device, dtype=dtype)      # [B,1,H,W,C]
-        frame_action = actions[:, frame_idx:frame_idx + 1]  # [B, 1, D]
+        # Determine grad eligibility for each frame in this block
+        # A frame needs grad if it's in the output window AND output_idx >= grad_frames_from
+        block_enable_grad = False
+        for fi in block_frame_indices:
+            in_output = fi >= output_start_frame
+            if in_output and grad_frames_from is not None:
+                out_idx = fi - output_start_frame
+                if out_idx >= grad_frames_from:
+                    block_enable_grad = True
+                    break
 
-        # Denoising loop 
+        # Start from pure noise for the whole block: [B, num_frame_per_block, H, W, C]
+        noisy_input = torch.randn([B, num_frame_per_block, H, W, C], device=device, dtype=dtype)
+
+        # Timestep tensor: [B, num_frame_per_block] — same value across all frames in block
+        def make_timestep(t_val):
+            return torch.full([B, num_frame_per_block], t_val, device=device, dtype=torch.long)
+
         denoised_x0 = None
+
         for step_idx, current_timestep in enumerate(denoising_step_list):
             is_exit_step = (step_idx == exit_step_idx)
-            timestep = torch.full(
-                [B, 1], current_timestep, device=device, dtype=torch.long
-            )
+            timestep = make_timestep(current_timestep)
 
-            if is_exit_step and enable_grad:
-                # WITH gradient — generator learns here
+            if is_exit_step and block_enable_grad:
+                # WITH gradient, generator learns from this block
                 v_pred = generator(
                     x=noisy_input,
                     t=timestep,
-                    action=frame_action,
+                    action=frame_actions,
                     external_kv_cache=kv_cache,
                 )
                 denoised_x0 = v_pred_to_x0(v_pred, noisy_input, alphas_cumprod, timestep)
                 break
 
-            elif is_exit_step and not enable_grad:
-                # Exit step, no gradient
+            elif is_exit_step and not block_enable_grad:
                 with torch.no_grad():
                     v_pred = generator(
                         x=noisy_input,
                         t=timestep,
-                        action=frame_action,
+                        action=frame_actions,
                         external_kv_cache=kv_cache,
                     )
                     denoised_x0 = v_pred_to_x0(v_pred, noisy_input, alphas_cumprod, timestep)
                 break
 
             else:
-                # Intermediate step — denoise and re-noise
+                # Intermediate denoising step — no grad, re-noise for next step
                 with torch.no_grad():
                     v_pred = generator(
                         x=noisy_input,
                         t=timestep,
-                        action=frame_action,
+                        action=frame_actions,
                         external_kv_cache=kv_cache,
                     )
                     x0_pred = v_pred_to_x0(v_pred, noisy_input, alphas_cumprod, timestep)
-
                     next_timestep = denoising_step_list[step_idx + 1]
-                    next_t = torch.full(
-                        [B, 1], next_timestep, device=device, dtype=torch.long
-                    )
+                    next_t = make_timestep(next_timestep)
                     fresh_noise = torch.randn_like(x0_pred)
                     noisy_input = q_sample(x0_pred, fresh_noise, alphas_cumprod, next_t)
 
-        # Store the frame
-        all_frames[:, frame_idx] = denoised_x0[:, 0]
+        # Collect frames that fall in the output window
+        for local_i, fi in enumerate(block_frame_indices):
+            if fi >= output_start_frame:
+                output_frames.append(denoised_x0[:, local_i])  # [B, H, W, C]
 
-        # Cache update pass (Algorithm 1, Line 13)
+        # Cache update: evict if full, then write this block's denoised output
         with torch.no_grad():
-            # Rolling eviction if cache is full
-            if kv_cache[0]["end_idx"] >= max_cache_frames:
-                evict_oldest_frame(kv_cache)
+            t_zero_block = torch.zeros([B, num_frame_per_block], device=device, dtype=torch.long)
+            while kv_cache[0]["end_idx"] + num_frame_per_block > max_cache_frames:
+                evict_oldest_block(kv_cache, num_frame_per_block)
 
-            cache_input = denoised_x0.detach()
             generator.forward_and_cache(
-                x=cache_input,
-                t=t_zero,
-                action=frame_action,
+                x=denoised_x0.detach(),
+                t=t_zero_block,
+                action=frame_actions,
                 external_kv_cache=kv_cache,
             )
 
-    # Return only the last n_output_frames 
-    output = all_frames[:, output_start_frame:]
+    output = torch.stack(output_frames, dim=1)  # [B, n_output_frames, H, W, C]
     return output
