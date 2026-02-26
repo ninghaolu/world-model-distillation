@@ -74,7 +74,7 @@ This codebase builds upon:
 ## Citation
 
 If you find this repository useful, please consider citing the following works:
-
+```bash
 @article{huang2025selfforcing,
   title={Self Forcing: Bridging the Train-Test Gap in Autoregressive Video Diffusion},
   author={Huang, Xun and Li, Zhengqi and He, Guande and Zhou, Mingyuan and Shechtman, Eli},
@@ -97,4 +97,4 @@ If you find this repository useful, please consider citing the following works:
   author={World-Model-Eval Contributors},
   year={2025},
   howpublished={\url{https://github.com/world-model-eval/world-model-eval}}
-}
+```
