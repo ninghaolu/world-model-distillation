@@ -18,13 +18,13 @@ Left: Original multi-step action-conditioned diffusion model
 Right: Few-step distilled model trained with DMD  
 
 The distilled model preserves motion consistency and action responsiveness
-while significantly reducing the number of diffusion steps.
+while significantly reducing the number of sampling steps.
 
 ---
 
 ## Requirements
 
-Tested with:
+This repository has been tested with::
 
 - **Python 3.12**
 - **PyTorch 2.7.1 (CUDA 12.6)**
@@ -53,13 +53,8 @@ sbatch scripts/train_dmd_chunkwise.bash
 
 This repository is designed to integrate with:
 
-- World-Model-Eval (Demo Website)  
+- Worldgym
   https://world-model-eval.github.io/
-
-- World-Model-Eval (Code Repository)  
-  https://github.com/world-model-eval/world-model-eval
-
-- WorldGym (Paper)  
   https://arxiv.org/abs/2506.00613
 
 It enables efficient evaluation of action-conditioned video world models as environment simulators for policy evaluation and planning.
@@ -78,7 +73,7 @@ This codebase builds upon:
 
 ## Citation
 
-If you find this repository useful, please consider citing:
+If you find this repository useful, please consider citing the following works:
 
 @article{huang2025selfforcing,
   title={Self Forcing: Bridging the Train-Test Gap in Autoregressive Video Diffusion},
