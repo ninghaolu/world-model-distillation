@@ -24,10 +24,10 @@ while significantly reducing the number of sampling steps.
 
 ## Requirements
 
-This repository has been tested with::
+This repository has been tested with:
 
-- **Python 3.12**
-- **PyTorch 2.7.1 (CUDA 12.6)**
+- Python 3.12
+- PyTorch 2.7.1 (CUDA 12.6)
 - NVIDIA GPU (L40S and H200 tested)
 
 ---
