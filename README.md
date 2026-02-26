@@ -1,8 +1,8 @@
 # Few-Step Distillation for Action-Conditioned World Models
 
-A few-step distillation pipeline for training **action-conditioned autoregressive video diffusion world models**, based on **Self-Forcing** and **Distribution Matching Distillation (DMD)**.
+A few-step distillation pipeline for training **action-conditioned autoregressive video world models**, based on **Self-Forcing** and **Distribution Matching Distillation (DMD)**.
 
-This repository is designed for efficient world model inference within a world-model evaluation pipeline.
+This repository is designed for efficient world model inference with an evaluation pipeline.
 
 ---
 
