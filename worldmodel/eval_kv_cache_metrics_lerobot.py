@@ -76,6 +76,7 @@ class Config:
     num_denoising_steps: int = 4
     max_cache_frames: int = 15
     context_noise: int = 0
+    num_frame_per_block : int = 1
 
     # Which model to use: "pretrained" or "dmd"
     model_type: str = "dmd"
@@ -111,6 +112,7 @@ def setup_models(ckpt_path: str, config: Config, norm_stats_path=None):
             use_ema=True,
             context_noise=config.context_noise,
             max_cache_frames=config.max_cache_frames,
+            num_frame_per_block=config.num_frame_per_block,  # ADD
         )
     else:
         # Pretrained model (original pyramid-scheduling WorldModel)
@@ -254,11 +256,14 @@ def eval_checkpoint_single_dataset(
             world_model.reset(init_frame)
 
             pred_frames = {}
+            pred_frames[0] = init_frame[0].cpu() 
             T = action_seq.shape[1]
-            for t in range(T):
-                action_t = action_seq[:, t]   # [B, D]
-                for frame_idx, decoded in world_model.generate_chunk(action_t):
-                    pred_frames[frame_idx] = decoded[0, 0].cpu()  # [H, W, C]
+            n = cfg.num_frame_per_block
+            for t in range(0, T, n):
+                action_chunk = action_seq[:, t:t+n]  # naturally truncates at T boundary
+                for frame_idx, decoded in world_model.generate_chunk(action_chunk):
+                    if frame_idx < T:  # only keep frames within GT length
+                        pred_frames[frame_idx] = decoded[0, 0].cpu()
 
             pred_video = torch.stack(
                 [pred_frames[i] for i in sorted(pred_frames.keys())],
@@ -295,7 +300,7 @@ def eval_checkpoint_single_dataset(
         sample_metrics = {}
         if compute_metrics and evaluator:
             try:
-                sample_metrics = evaluator.evaluate_single(gt_video_uint8, pred_video_uint8)
+                sample_metrics = evaluator.evaluate_single(gt_video_uint8[1:], pred_video_uint8[1:])    # skip frame 0
                 if 'metrics' in output_paths:
                     save_metadata(
                         os.path.join(output_paths['metrics'], f"{sample_name}_metrics.json"),
@@ -348,7 +353,7 @@ def submit_eval_checkpoint_single_dataset(
     config: Dict[str, Any],
     *,
     device: Optional[str] = None,
-    output_base_dir: str = "/scratch/nl2752/cloth_folding_dmd_100_new_inference",
+    output_base_dir: str = "/scratch/nl2752/cloth_folding_dmd_new_codebase_chunkwise",
     split: str = "test",
     max_samples: Optional[int] = None,
     compute_metrics: bool = True,
@@ -363,7 +368,7 @@ def submit_eval_checkpoint_single_dataset(
     cpus_per_task: int = 12,
     gpus: int = 1,
     constraint: str = "h200",
-    log_dir: str = "logs_cf_dmd_100_new_inference",
+    log_dir: str = "logs_cf_dmd_100_new_codebase_chunkwise",
 ) -> str:
     import sys
     import pickle
@@ -437,7 +442,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     data_dir = "/projects/work/yang-lab/users/yz12129"
-    ckpt600m_dmd = "/scratch/nl2752/world-model-distillation/outputs/20260221_234405_dmd/dmd_ckpt_000010000.pt"
+    ckpt600m_dmd = "/scratch/nl2752/dmd_ckpt_000005000.pt"
 
     subsets = [
         "converted_rollout_data/folding_rollout_jan15_ds1",
@@ -459,6 +464,7 @@ if __name__ == "__main__":
                 "heads":       16,
                 "n_frames":    100,
                 "max_cache_frames": 13,
+                "num_frame_per_block": 3
             },
             max_samples=100,
             compute_metrics=True,
@@ -466,5 +472,5 @@ if __name__ == "__main__":
             save_gifs=True,
             fps=10,
             job_name=f"eval_{subset_name}",
-            time_limit="04:00:00",
+            time_limit="02:00:00",
         )

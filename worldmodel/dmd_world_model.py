@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from model_with_kv_cache import DiT
 from vae import VAE
-from dmd.cache import create_kv_cache, evict_oldest_frame
+from dmd.cache import create_kv_cache, evict_oldest_block
 from dmd.diffusion_utils import get_alphas_cumprod, get_denoising_step_list, v_pred_to_x0, q_sample
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,7 @@ class DMDWorldModel:
         context_noise: int = 0,
         max_cache_frames: int = 15,
         denoising_step_list: Optional[list] = None,
+        num_frame_per_block: int = 1,
     ):
         self.config = config
         self.device = torch.device(config.device)
@@ -174,6 +175,7 @@ class DMDWorldModel:
         self.batch_size = None
         self.latent_shape = None
         self.curr_frame = 0
+        self.num_frame_per_block = num_frame_per_block
 
         print(f"\n[DMDWorldModel] Ready | {_gpu_summary(self.device)}")
         print(f"{'='*60}\n")
@@ -261,91 +263,38 @@ class DMDWorldModel:
         frame_idx = self.curr_frame
         t0 = time.time()
 
-        # Normalize action to [B, 1, action_dim]
+        # Normalize to [B, n, D]
         if action_vec.dim() == 2:
-            action_vec = action_vec.unsqueeze(1)
+            action_vec = action_vec.unsqueeze(1)  # [B, D] → [B, 1, D]
+        # action_vec is now [B, n, D]
+        n = action_vec.shape[1]
+
+        action_vec = action_vec.to(device=self.device, dtype=self.dtype)
         if action_vec.shape[-1] < self.model.action_dim:
             action_vec = F.pad(action_vec, (0, self.model.action_dim - action_vec.shape[-1]))
-        action_vec = action_vec.to(device=self.device, dtype=self.dtype)
 
-        t_zero = torch.zeros([self.batch_size, 1], device=self.device, dtype=torch.long)
-        cache_end_idx = self.kv_cache[0]["end_idx"]
-
-        print(f"[frame {frame_idx:03d}] Generating | "
-              f"cache_frames={cache_end_idx}/{self.max_cache_frames} | "
-              f"{_gpu_summary(self.device)}")
+        t_zero_block = torch.zeros([self.batch_size, n], device=self.device, dtype=torch.long)
 
         with torch.autocast(device_type="cuda", dtype=self.dtype):
-
-            # Step 3.1: Few-step denoising
             noisy_input = torch.randn(
-                [self.batch_size, 1, H_l, W_l, C_l],
+                [self.batch_size, n, H_l, W_l, C_l],
                 device=self.device, dtype=self.dtype,
             )
-
             denoised_x0 = None
             for step_idx, current_timestep in enumerate(self.denoising_step_list):
-                timestep = torch.full(
-                    [self.batch_size, 1], current_timestep,
-                    device=self.device, dtype=torch.long,
-                )
-                v_pred = self.model(
-                    x=noisy_input,
-                    t=timestep,
-                    action=action_vec,
-                    external_kv_cache=self.kv_cache,
-                )
-                denoised_x0 = v_pred_to_x0(
-                    v_pred, noisy_input, self.alphas_cumprod, timestep
-                )
+                timestep = torch.full([self.batch_size, n], current_timestep, device=self.device, dtype=torch.long)
+                v_pred = self.model(x=noisy_input, t=timestep, action=action_vec, external_kv_cache=self.kv_cache)
+                denoised_x0 = v_pred_to_x0(v_pred, noisy_input, self.alphas_cumprod, timestep)
                 if step_idx < len(self.denoising_step_list) - 1:
-                    next_t = torch.full(
-                        [self.batch_size, 1], self.denoising_step_list[step_idx + 1],
-                        device=self.device, dtype=torch.long,
-                    )
-                    noisy_input = q_sample(
-                        denoised_x0,
-                        torch.randn_like(denoised_x0),
-                        self.alphas_cumprod,
-                        next_t,
-                    )
+                    next_t = torch.full([self.batch_size, n], self.denoising_step_list[step_idx + 1], device=self.device, dtype=torch.long)
+                    noisy_input = q_sample(denoised_x0, torch.randn_like(denoised_x0), self.alphas_cumprod, next_t)
 
-            # Step 3.3: Update KV cache
-            evicted = False
-            if self.kv_cache[0]["end_idx"] >= self.max_cache_frames:
-                evict_oldest_frame(self.kv_cache)
-                evicted = True
+            while self.kv_cache[0]["end_idx"] + n > self.max_cache_frames:
+                evict_oldest_block(self.kv_cache, n)
+            self.model.forward_and_cache(x=denoised_x0, t=t_zero_block, action=action_vec, external_kv_cache=self.kv_cache)
 
-            cache_input = denoised_x0
-            if self.context_noise > 0:
-                ctx_t = torch.full(
-                    [self.batch_size, 1], self.context_noise,
-                    device=self.device, dtype=torch.long,
-                )
-                cache_input = q_sample(
-                    denoised_x0,
-                    torch.randn_like(denoised_x0),
-                    self.alphas_cumprod,
-                    ctx_t,
-                )
-            self.model.forward_and_cache(
-                x=cache_input,
-                t=t_zero,
-                action=action_vec,
-                external_kv_cache=self.kv_cache,
-            )
+            decoded = self.vae.decode(denoised_x0)  # [B, n, H, W, C]
 
-            # Decode
-            decoded = self.vae.decode(denoised_x0)
-
-        elapsed = time.time() - t0
-        new_cache_end = self.kv_cache[0]["end_idx"]
-        evict_str = " [evicted oldest]" if evicted else ""
-        print(f"[frame {frame_idx:03d}] Done in {elapsed:.2f}s | "
-              f"cache_frames={new_cache_end}/{self.max_cache_frames}{evict_str} | "
-              f"{_gpu_summary(self.device)}")
-
-        # Step 3.4: Advance
-        self.curr_frame += self.chunk_size
-
-        yield frame_idx, decoded
+        self.curr_frame += n
+        for i in range(n):
+            yield frame_idx + i, decoded[:, i:i+1]
